@@ -42,11 +42,57 @@ for (const [sName, storms] of Object.entries(scenarios)) {
       const a = E.energyUnitsForDay(st.day);
       st = E.playDay(st, strat(st, a)).state;
     }
-    const worst = Math.max(0, ...st.history.map(r => r.eventDose));
+    const worst = Math.max(0, ...st.history.map(r => r.episodeDose));
     console.log(
       `  ${name.padEnd(22)} ${st.status.padEnd(9)} day ${String(st.day).padStart(2)}` +
       `  science ${String(st.science).padStart(3)}  berm ${String(st.bermCm).padStart(2)}cm` +
       `  worst storm ${worst.toFixed(0).padStart(3)} mSv  tank ${st.tankKg.toFixed(1)} kg`
     );
   }
+}
+
+// =====================================================================
+// Real DONKI data: many random 14-day windows from storms.json
+// =====================================================================
+const fs = require("fs");
+if (fs.existsSync("./storms.json")) {
+  const S = require("./storms.js");
+  const data = JSON.parse(fs.readFileSync("./storms.json", "utf8").replace(/^﻿/, ""));
+  const N = 500;
+
+  const runOne = (storms, strat) => {
+    let st = E.newGame(storms);
+    while (st.status === "playing") st = E.playDay(st, strat(st, E.energyUnitsForDay(st.day))).state;
+    return st;
+  };
+
+  // How many storms does a typical mission get?
+  const sizes = [];
+  for (let i = 0; i < N; i++) sizes.push(S.pickMission(data, 1000 + i).storms.length);
+  const avg = sizes.reduce((a, b) => a + b, 0) / N;
+  console.log(`\n=== Real DONKI windows (${N} random missions, avg ${avg.toFixed(1)} storms, max ${Math.max(...sizes)})`);
+
+  for (const [name, strat] of Object.entries(strategies)) {
+    const r = { win: 0, fail_o2: 0, fail_rad: 0, sci: 0 };
+    for (let i = 0; i < N; i++) {
+      const st = runOne(S.pickMission(data, 1000 + i).storms, strat);
+      r[st.status]++;
+      if (st.status === "win") r.sci += st.science;
+    }
+    console.log(`  ${name.padEnd(22)} win ${String(Math.round(100 * r.win / N)).padStart(3)}%` +
+      `  o2-fail ${String(r.fail_o2).padStart(3)}  rad-fail ${String(r.fail_rad).padStart(3)}` +
+      `  avg science (wins) ${(r.win ? r.sci / r.win : 0).toFixed(1)}`);
+  }
+
+  const may = S.missionFromDate(data, "2024-05-05");
+  console.log(`\n=== May 2024 scenario (${may.startDate} -> ${may.endDate}):`);
+  for (const s of may.storms)
+    console.log(`  day ${String(s.day).padStart(2)} ${s.date} ${s.type} ${s.strength}` +
+      (s.warnDay ? ` (warning day ${s.warnDay})` : " (no warning)"));
+  for (const [name, strat] of Object.entries(strategies)) {
+    const st = runOne(may.storms, strat);
+    console.log(`  ${name.padEnd(22)} ${st.status.padEnd(9)} science ${st.science}`);
+  }
+} else {
+  console.log("\n(storms.json not found — skipping real-data test)");
 }

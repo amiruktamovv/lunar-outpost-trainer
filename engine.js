@@ -25,16 +25,19 @@ const CONFIG = {
   o2PerPersonKgDay: 0.84,     // [REAL] норма NASA на человека в сутки
   electrolysisMinKWhPerKg: 4.97, // [PHYS] термодинамический минимум
   electrolysisEfficiency: 0.70,  // [GAME] КПД установки (уточнить)
-  tankStartKg: 15,            // [GAME] запас в баке на старте
+  tankStartKg: 8,             // [GAME] запас в баке на старте (~2.5 дня)
   tankMaxKg: 20,              // [GAME] вместимость бака
 
   // ---- Радиация -----------------------------------------------------
   backgroundMSvDay: 1.369,    // [REAL] Chang'e-4, фон на поверхности Луны
   eventLimitMSv: 250,         // [REAL] лимит NASA за одно солнечное событие
   careerLimitMSv: 600,        // [REAL] карьерный лимит NASA
+  sepExposedFraction: 0.25,  // [GAME] доля SEP, пойманная снаружи до укрытия
   bermCmPerUnit: 2,           // [GAME] см грунта за 1 единицу энергии
   bermTenfoldCm: 50,          // [REAL] 50 см грунта ~ ослабление в 10 раз
-  stormDoseMSv: { C: 30, M: 120, X: 300 }, // [GAME] доза бури без защиты
+  // [GAME] доза бури без защиты. Сила бури из DONKI по скорости CME
+  // (классы CCMC): weak <1000 км/с, moderate 1000–1999, strong ≥2000
+  stormDoseMSv: { weak: 30, moderate: 120, strong: 300 },
 };
 
 // ---------------------------------------------------------------------
@@ -72,15 +75,19 @@ function shieldFactor(cm) {
   return Math.exp(-K_ATTENUATION * cm);
 }
 
-// Класс вспышки "X1.0" -> "X"
-function stormLetter(flareClass) {
-  const letter = (flareClass || "C")[0].toUpperCase();
-  return CONFIG.stormDoseMSv[letter] ? letter : "C";
+// Сила бури: берём storm.strength ("weak"|"moderate"|"strong"),
+// для старых тестов понимаем и класс вспышки "X1.0" -> strong
+const FLARE_TO_STRENGTH = { C: "weak", M: "moderate", X: "strong" };
+function stormStrength(storm) {
+  if (storm.strength && CONFIG.stormDoseMSv[storm.strength]) return storm.strength;
+  const letter = (storm.flareClass || "C")[0].toUpperCase();
+  return FLARE_TO_STRENGTH[letter] || "weak";
 }
 
 // ---------------------------------------------------------------------
 // Новая игра. storms — список бурь на эту миссию:
-//   { day, type: "CME" | "SEP", flareClass: "X1.0", warnDay, date, link }
+//   { day, type: "CME" | "SEP", strength: "weak"|"moderate"|"strong", warnDay, date, link }
+//   (готовый список делает storms.js -> pickMission)
 // ---------------------------------------------------------------------
 function newGame(storms = []) {
   return {
@@ -88,6 +95,8 @@ function newGame(storms = []) {
     tankKg: CONFIG.tankStartKg,
     bermCm: 0,
     missionDoseMSv: 0,
+    episodeDoseMSv: 0,   // доза текущего эпизода бурь (дни подряд)
+    lastStormDay: -9,
     science: 0,
     storms,
     status: "playing",   // "playing" | "win" | "fail_o2" | "fail_rad"
@@ -132,18 +141,27 @@ function playDay(state, alloc) {
   let scienceDone = science;
 
   if (storm) {
-    const d0 = CONFIG.stormDoseMSv[stormLetter(storm.flareClass)];
+    const d0 = CONFIG.stormDoseMSv[stormStrength(storm)];
     const f = shieldFactor(s.bermCm);
     if (storm.type === "CME") {
       // Было предупреждение: экипаж весь день в убежище, наука стоит
       eventDose = d0 * f;
       scienceDone = 0;
     } else {
-      // SEP без предупреждения: половину дозы получили снаружи
-      eventDose = d0 * (0.5 + 0.5 * f);
+      // SEP без предупреждения: часть дозы получили снаружи, пока бежали в укрытие
+      const x = CONFIG.sepExposedFraction;
+      eventDose = d0 * (x + (1 - x) * f);
       scienceDone = Math.floor(science / 2);
     }
   }
+
+  // Лимит NASA 250 мЗв — на одно солнечное СОБЫТИЕ. Бури в дни подряд
+  // (как в мае 2024) — это одно событие, их дозы складываются.
+  if (storm) {
+    s.episodeDoseMSv = (s.lastStormDay === s.day - 1 ? s.episodeDoseMSv : 0) + eventDose;
+    s.lastStormDay = s.day;
+  }
+  const episodeDose = storm ? s.episodeDoseMSv : 0;
 
   const dayDose = CONFIG.backgroundMSvDay + eventDose;
   s.missionDoseMSv += dayDose;
@@ -151,13 +169,13 @@ function playDay(state, alloc) {
 
   // 4. Проверка исхода
   if (s.tankKg < 0) s.status = "fail_o2";
-  else if (eventDose > CONFIG.eventLimitMSv) s.status = "fail_rad";
+  else if (episodeDose > CONFIG.eventLimitMSv) s.status = "fail_rad";
   else if (s.day >= CONFIG.missionDays) s.status = "win";
 
   const report = {
     day: s.day, available, alloc: { life, berm, science },
     o2Made, tankKg: s.tankKg, bermCm: s.bermCm,
-    storm: storm || null, eventDose, dayDose,
+    storm: storm || null, eventDose, episodeDose, dayDose,
     scienceDone, status: s.status,
   };
   s.history.push(report);
@@ -169,6 +187,6 @@ function playDay(state, alloc) {
 if (typeof module !== "undefined") {
   module.exports = {
     CONFIG, PANEL_POWER_KW, KWH_PER_KG_O2, O2_PER_UNIT_KG, O2_NEED_KG_DAY,
-    K_ATTENUATION, energyUnitsForDay, shieldFactor, newGame, warningsFor, playDay,
+    K_ATTENUATION, energyUnitsForDay, shieldFactor, stormStrength, newGame, warningsFor, playDay,
   };
 }
